@@ -14,6 +14,9 @@ import re
 BASE_URL = "https://world.openfoodfacts.org"
 SEARCH_URL = f"{BASE_URL}/cgi/search.pl"
 
+# Countries to include (USA and UK only)
+ALLOWED_COUNTRIES = ["en:united-states", "en:united-kingdom", "en:us", "en:uk"]
+
 
 def search_products(page=1, page_size=100, with_allergens=True):
     """Search for products with or without allergens"""
@@ -47,7 +50,7 @@ def search_products(page=1, page_size=100, with_allergens=True):
 
 
 def search_by_allergen(allergen_tag, page=1, page_size=50):
-    """Search for products containing a specific allergen"""
+    """Search for products containing a specific allergen (USA/UK only)"""
     params = {
         "action": "process",
         "tagtype_0": "languages",
@@ -56,7 +59,10 @@ def search_by_allergen(allergen_tag, page=1, page_size=50):
         "tagtype_1": "allergens",
         "tag_contains_1": "contains",
         "tag_1": allergen_tag,
-        "fields": "code,product_name,ingredients_text_en,allergens_tags,url",
+        "tagtype_2": "countries",
+        "tag_contains_2": "contains",
+        "tag_2": "en:united-states",  # Primary filter: USA
+        "fields": "code,product_name,ingredients_text_en,allergens_tags,countries_tags,url",
         "page_size": page_size,
         "page": page,
         "json": 1,
@@ -72,8 +78,8 @@ def search_by_allergen(allergen_tag, page=1, page_size=50):
         return []
 
 
-def search_without_allergens(page=1, page_size=50, max_retries=3):
-    """Search for products without allergens with retry logic"""
+def search_without_allergens(page=1, page_size=50, max_retries=3, country="en:united-states"):
+    """Search for products without allergens with retry logic (USA/UK only)"""
     params = {
         "action": "process",
         "tagtype_0": "languages",
@@ -82,10 +88,10 @@ def search_without_allergens(page=1, page_size=50, max_retries=3):
         "tagtype_1": "states",
         "tag_contains_1": "contains",
         "tag_1": "ingredients-completed",
-        "tagtype_2": "allergens",
-        "tag_contains_2": "does_not_contain",
-        "tag_2": "en:none",  # Products tagged as having no allergens
-        "fields": "code,product_name,ingredients_text_en,allergens_tags,traces_tags,url",
+        "tagtype_2": "countries",
+        "tag_contains_2": "contains",
+        "tag_2": country,
+        "fields": "code,product_name,ingredients_text_en,allergens_tags,traces_tags,countries_tags,url",
         "page_size": page_size,
         "page": page,
         "json": 1,
@@ -128,13 +134,23 @@ def format_allergens(allergens_tags):
 
 
 def clean_text(text):
-    """Clean text by removing semicolons, newlines, and emojis"""
+    """Clean text by removing semicolons, newlines, emojis, and special symbols"""
     if not text:
         return ""
     text = str(text)
     text = text.replace(";", ",")
     text = text.replace("\n", " ")
     text = text.replace("\r", " ")
+
+    # Remove common special symbols
+    special_symbols = ["•", "·", "●", "○", "■", "□", "▪", "▫", "►", "◄", "★", "☆",
+                       "→", "←", "↑", "↓", "«", "»", "™", "®", "©", "°", "±",
+                       "¹", "²", "³", "¼", "½", "¾", "×", "÷", "†", "‡", "§", "¶",
+                       "…", "‹", "›", "€", "£", "¥", "¢", "₹", "฿",
+                       "_", "*"]  # underscore and asterisk
+    for symbol in special_symbols:
+        text = text.replace(symbol, " ")
+
     # Remove emojis and other unicode symbols
     emoji_pattern = re.compile(
         "["
@@ -148,6 +164,8 @@ def clean_text(text):
         "\U0001FA00-\U0001FA6F"  # chess symbols
         "\U0001FA70-\U0001FAFF"  # symbols extended
         "\U00002600-\U000026FF"  # misc symbols
+        "\U00002022"             # bullet point •
+        "\U000000B7"             # middle dot ·
         "]+",
         flags=re.UNICODE
     )
@@ -156,8 +174,82 @@ def clean_text(text):
     return text
 
 
+def is_from_allowed_country(product):
+    """Check if product is from USA or UK"""
+    countries = product.get("countries_tags", [])
+    if not countries:
+        return False
+
+    for country in countries:
+        country_lower = country.lower()
+        if any(allowed in country_lower for allowed in ["united-states", "united-kingdom", "us", "uk"]):
+            return True
+    return False
+
+
+def is_english_text(text):
+    """
+    Check if text is primarily in English.
+    Returns False if text contains too many non-English characters or patterns.
+    """
+    if not text or len(text) < 5:
+        return False
+
+    text_lower = text.lower()
+
+    # Check for non-ASCII characters (non-English alphabets)
+    non_ascii_count = sum(1 for char in text if ord(char) > 127)
+    non_ascii_ratio = non_ascii_count / len(text)
+
+    # If more than 10% non-ASCII characters, likely not English
+    if non_ascii_ratio > 0.10:
+        return False
+
+    # Common non-English patterns to reject
+    non_english_patterns = [
+        # French
+        "é", "è", "ê", "ë", "à", "â", "ô", "î", "ï", "ù", "û", "ç", "œ", "æ",
+        # German
+        "ä", "ö", "ü", "ß",
+        # Spanish/Portuguese
+        "ñ", "ã", "õ",
+        # Arabic
+        "ال", "من", "في",
+        # Chinese/Japanese/Korean (check for character ranges)
+        # Other indicators
+        "ingrédients", "zucker", "azúcar", "açúcar", "zutaten",
+        "sucre", "farine", "huile", "lait", "beurre", "œufs",
+        "leche", "harina", "aceite", "mantequilla",
+        "milch", "mehl", "öl", "butter", "eier",
+    ]
+
+    # Count non-English pattern matches
+    non_english_matches = sum(1 for pattern in non_english_patterns if pattern in text_lower)
+
+    # If too many non-English patterns found, reject
+    if non_english_matches >= 3:
+        return False
+
+    # Check for common English food words (positive indicator)
+    english_food_words = [
+        "sugar", "salt", "water", "oil", "flour", "milk", "cream", "butter",
+        "egg", "wheat", "contains", "ingredients", "natural", "flavor",
+        "extract", "powder", "syrup", "acid", "vitamin", "protein",
+        "modified", "starch", "emulsifier", "preservative", "color",
+        "artificial", "organic", "whole", "enriched", "dried"
+    ]
+
+    english_matches = sum(1 for word in english_food_words if word in text_lower)
+
+    # Should have at least some English food words
+    if english_matches < 2:
+        return False
+
+    return True
+
+
 def is_valid_product(product, require_allergens=True):
-    """Check if product has required fields"""
+    """Check if product has required fields, valid ingredient data, and is in English"""
     code = product.get("code", "")
     name = product.get("product_name", "")
     ingredients = product.get("ingredients_text_en", "")
@@ -167,6 +259,35 @@ def is_valid_product(product, require_allergens=True):
         return False
 
     if len(ingredients) < 10:  # Too short to be useful
+        return False
+
+    # Check that product name is in English (no excessive non-ASCII)
+    name_non_ascii = sum(1 for char in name if ord(char) > 127)
+    if len(name) > 0 and (name_non_ascii / len(name)) > 0.15:
+        return False  # Product name has too many non-English characters
+
+    # Check that ingredients are in English
+    if not is_english_text(ingredients):
+        return False
+
+    # Validate ingredients contain actual food-related content
+    # Check for common food words to filter out garbage data
+    ingredients_lower = ingredients.lower()
+    food_indicators = [
+        "sugar", "salt", "water", "oil", "flour", "milk", "cream", "butter",
+        "egg", "wheat", "corn", "rice", "starch", "extract", "flavor",
+        "acid", "vitamin", "protein", "fat", "sodium", "calcium",
+        "natural", "organic", "powder", "syrup", "juice", "puree",
+        "vegetable", "fruit", "meat", "fish", "chicken", "beef",
+        "tomato", "potato", "onion", "garlic", "spice", "herb"
+    ]
+
+    has_food_content = any(word in ingredients_lower for word in food_indicators)
+    if not has_food_content:
+        return False  # Likely garbage data
+
+    # Check country (must be USA or UK)
+    if not is_from_allowed_country(product):
         return False
 
     if require_allergens:
@@ -233,8 +354,37 @@ def is_truly_allergen_free(product):
     return True
 
 
+def search_by_allergen_country(allergen_tag, country, page=1, page_size=50):
+    """Search for products containing a specific allergen in a specific country"""
+    params = {
+        "action": "process",
+        "tagtype_0": "languages",
+        "tag_contains_0": "contains",
+        "tag_0": "en",
+        "tagtype_1": "allergens",
+        "tag_contains_1": "contains",
+        "tag_1": allergen_tag,
+        "tagtype_2": "countries",
+        "tag_contains_2": "contains",
+        "tag_2": country,
+        "fields": "code,product_name,ingredients_text_en,allergens_tags,countries_tags,url",
+        "page_size": page_size,
+        "page": page,
+        "json": 1,
+        "sort_by": "unique_scans_n"
+    }
+
+    try:
+        response = requests.get(SEARCH_URL, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json().get("products", [])
+    except Exception as e:
+        print(f"Error fetching allergen {allergen_tag} for {country}: {e}")
+        return []
+
+
 def collect_products_with_allergens(target_count=150):
-    """Collect products WITH allergens ensuring diversity across allergen types"""
+    """Collect products WITH allergens ensuring diversity (USA & UK only)"""
     collected = {}
     allergen_counts = {}  # Track count per primary allergen
 
@@ -255,7 +405,10 @@ def collect_products_with_allergens(target_count=150):
         "en:gluten": 10,         # Gluten (wheat) - kept low since it appears with others
     }
 
-    print(f"Collecting {target_count} products WITH allergens (diverse)...")
+    # Countries to search
+    countries = ["en:united-states", "en:united-kingdom"]
+
+    print(f"Collecting {target_count} products WITH allergens (USA & UK only)...")
     print("Target distribution:")
     for allergen, target in allergen_targets.items():
         print(f"  {allergen}: {target}")
@@ -269,39 +422,45 @@ def collect_products_with_allergens(target_count=150):
 
         print(f"  Searching for {allergen} (target: {target})...")
 
-        for page in range(1, 10):  # Up to 10 pages per allergen
+        # Search in both USA and UK
+        for country in countries:
             if allergen_counts[allergen] >= target or len(collected) >= target_count:
                 break
 
-            products = search_by_allergen(allergen, page=page, page_size=50)
+            country_name = "USA" if "united-states" in country else "UK"
+            print(f"    Searching in {country_name}...")
 
-            for product in products:
+            for page in range(1, 6):  # Up to 6 pages per allergen per country
                 if allergen_counts[allergen] >= target or len(collected) >= target_count:
                     break
 
-                code = product.get("code", "")
-                allergens_tags = product.get("allergens_tags", [])
+                products = search_by_allergen_country(allergen, country, page=page, page_size=50)
 
-                # Skip if already collected
-                if not code or code in collected:
-                    continue
+                for product in products:
+                    if allergen_counts[allergen] >= target or len(collected) >= target_count:
+                        break
 
-                # For non-gluten allergens, prefer products where this allergen is primary
-                # (helps avoid everything just being "gluten + something")
-                if allergen != "en:gluten":
-                    # Check if this allergen is actually in the product
-                    has_target_allergen = any(allergen in tag or allergen.replace("en:", "") in tag
-                                              for tag in allergens_tags)
-                    if not has_target_allergen:
+                    code = product.get("code", "")
+                    allergens_tags = product.get("allergens_tags", [])
+
+                    # Skip if already collected
+                    if not code or code in collected:
                         continue
 
-                if is_valid_product(product, require_allergens=True):
-                    collected[code] = product
-                    allergen_counts[allergen] += 1
-                    allergen_name = allergen.replace("en:", "").replace("-", " ").title()
-                    print(f"    [{allergen_name}] Found: {allergen_counts[allergen]}/{target} (Total: {len(collected)}/{target_count})")
+                    # For non-gluten allergens, prefer products where this allergen is primary
+                    if allergen != "en:gluten":
+                        has_target_allergen = any(allergen in tag or allergen.replace("en:", "") in tag
+                                                  for tag in allergens_tags)
+                        if not has_target_allergen:
+                            continue
 
-            time.sleep(0.5)  # Rate limiting
+                    if is_valid_product(product, require_allergens=True):
+                        collected[code] = product
+                        allergen_counts[allergen] += 1
+                        allergen_name = allergen.replace("en:", "").replace("-", " ").title()
+                        print(f"      [{allergen_name}] Found: {allergen_counts[allergen]}/{target} (Total: {len(collected)}/{target_count})")
+
+                time.sleep(0.5)  # Rate limiting
 
         print(f"  Collected {allergen_counts[allergen]} for {allergen}")
 
@@ -316,42 +475,52 @@ def collect_products_with_allergens(target_count=150):
 
 
 def collect_products_without_allergens(target_count=50):
-    """Collect products that are 100% allergen-free"""
+    """Collect products that are 100% allergen-free (USA & UK only)"""
     collected = {}
 
-    print(f"\nCollecting {target_count} products WITHOUT any allergens (strict validation)...")
+    # Countries to search
+    countries = ["en:united-states", "en:united-kingdom"]
+
+    print(f"\nCollecting {target_count} products WITHOUT any allergens (USA & UK only)...")
     print("Checking: allergen tags, traces tags, AND ingredient keywords\n")
 
-    for page in range(1, 50):  # More pages since strict filtering reduces matches
+    for country in countries:
         if len(collected) >= target_count:
             break
 
-        products = search_without_allergens(page=page, page_size=100)
+        country_name = "USA" if "united-states" in country else "UK"
+        print(f"  Searching in {country_name}...")
 
-        if not products:
-            print(f"  No more products found at page {page}")
-            continue
-
-        for product in products:
+        for page in range(1, 30):  # More pages since strict filtering reduces matches
             if len(collected) >= target_count:
                 break
 
-            code = product.get("code", "")
+            products = search_without_allergens(page=page, page_size=100, country=country)
 
-            # Skip if already collected or invalid
-            if not code or code in collected:
-                continue
+            if not products:
+                print(f"    No more products found at page {page}")
+                break
 
-            if not is_valid_product(product, require_allergens=False):
-                continue
+            for product in products:
+                if len(collected) >= target_count:
+                    break
 
-            # STRICT validation: 100% allergen-free
-            if is_truly_allergen_free(product):
-                collected[code] = product
-                name = product.get("product_name", "")[:40]
-                print(f"  Found: {len(collected)}/{target_count} - {name}")
+                code = product.get("code", "")
 
-        time.sleep(0.5)
+                # Skip if already collected or invalid
+                if not code or code in collected:
+                    continue
+
+                if not is_valid_product(product, require_allergens=False):
+                    continue
+
+                # STRICT validation: 100% allergen-free
+                if is_truly_allergen_free(product):
+                    collected[code] = product
+                    name = product.get("product_name", "")[:40]
+                    print(f"    Found: {len(collected)}/{target_count} - {name}")
+
+            time.sleep(0.5)
 
     if len(collected) < target_count:
         print(f"\n  Warning: Only found {len(collected)} truly allergen-free products")

@@ -56,8 +56,11 @@ python map_allergens.py
 **Requirements Met:**
 - 150 products WITH allergens (diverse distribution)
 - 50 products WITHOUT any allergens (100% allergen-free)
+- **Products from USA and UK only**
+- **Product name and ingredients in English only**
 - Data saved as semicolon-separated `.txt` file
 - Each product tagged with unique ID
+- Validates ingredients contain actual food content (filters garbage data)
 
 **Data Format:**
 ```
